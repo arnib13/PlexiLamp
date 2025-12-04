@@ -1,0 +1,1022 @@
+from machine import Pin
+import time
+import neopixel
+import urandom
+import network
+import socket
+
+# ========= WIFI CONFIG =========
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+
+# ========= LED / BUTTON CONFIG =========
+NUM_LEDS = 12
+LED_PIN = 16       # D6 (your working GPIO)
+BUTTON_PIN = 17    # D7 (adjust if needed)
+DEBOUNCE_MS = 200
+
+# ========= MODES =========
+# 0: Rainbow Flow
+# 1: Custom Solid (color wheel)
+# 2: Forest Green
+# 3: Lava Red
+# 4: Royal Purple
+# 5: Strobe Blink (custom color)
+# 6: Color Wipe (custom color)
+# 7: Sparkle (white)
+# 8: Breathing (custom color)
+# 9: Larson Scanner (custom color)
+# 10: Theater Chase (custom color)
+# 11: Rainbow Chase
+# 12: Comet (custom color)
+# 13: Fire Flicker
+# 14: Ocean Wave
+# 15: Color Sparkle (custom color)
+# 16: Rainbow Sparkle
+# 17: Soft Flicker (custom color)
+# 18: Rainbow Wave
+# 19: Random Solid Colors
+NUM_MODES = 20
+
+MODE_NAMES = [
+    "0 · Rainbow Flow",
+    "1 · Custom Solid",
+    "2 · Forest Green",
+    "3 · Lava Red",
+    "4 · Royal Purple",
+    "5 · Strobe Blink",
+    "6 · Color Wipe",
+    "7 · Sparkle",
+    "8 · Breathing",
+    "9 · Larson Scanner",
+    "10 · Theater Chase",
+    "11 · Rainbow Chase",
+    "12 · Comet",
+    "13 · Fire Flicker",
+    "14 · Ocean Wave",
+    "15 · Color Sparkle",
+    "16 · Rainbow Sparkle",
+    "17 · Soft Flicker",
+    "18 · Rainbow Wave",
+    "19 · Random Solid",
+]
+
+# ========= GLOBAL STATE =========
+mode = 0
+last_mode = -1
+
+last_button_state = 1
+button_stable_state = 1
+last_debounce_time = 0
+
+# User color + brightness
+current_color = (255, 0, 0)  # default red
+brightness = 255             # 0–255
+
+# Rainbow
+rainbow_offset = 0
+last_rainbow_time = 0
+
+# Custom solid update
+last_custom_update = 0
+
+# Blink
+blink_on = False
+last_blink_time = 0
+
+# Color wipe
+wipe_index = 0
+last_wipe_time = 0
+
+# Sparkle
+last_sparkle_time = 0
+
+# Breathing
+breathe_level = 0
+breathe_dir = 1
+last_breathe_time = 0
+
+# Larson
+larson_pos = 0
+larson_dir = 1
+last_larson_time = 0
+
+# Theater
+theater_index = 0
+last_theater_time = 0
+
+# Rainbow chase
+theater2_index = 0
+theater2_offset = 0
+last_theater2_time = 0
+
+# Comet
+comet_pos = 0
+last_comet_time = 0
+
+# Fire
+last_fire_time = 0
+
+# Ocean wave
+wave_offset = 0
+last_wave_time = 0
+
+# Color Sparkle
+last_color_sparkle_time = 0
+
+# Rainbow Sparkle
+last_rainbow_sparkle_time = 0
+
+# Soft Flicker
+last_flicker_time = 0
+
+# Rainbow Wave
+rainbow_wave_offset = 0
+last_rainbow_wave_time = 0
+
+# Random Solid
+last_random_solid_time = 0
+
+# ========= HARDWARE SETUP =========
+np = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), NUM_LEDS)
+button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)  # button to GND
+
+
+# ========= WIFI + WEB SERVER =========
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Connecting to WiFi...")
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        while not wlan.isconnected():
+            time.sleep(0.5)
+            print(".", end="")
+        print()
+    print("Connected, IP:", wlan.ifconfig()[0])
+    return wlan
+
+def start_web_server(wlan):
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(addr)
+    s.listen(1)
+    s.settimeout(0.1)
+    print("Web server listening on http://%s/" % wlan.ifconfig()[0])
+    return s
+
+def color_to_hex(c):
+    r, g, b = c
+    return "#%02X%02X%02X" % (r, g, b)
+
+def web_page():
+    label = MODE_NAMES[mode]
+    hex_color = color_to_hex(current_color)
+    b_val = brightness
+
+    template = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>XIAO ESP32-C6 LED Controller</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root {
+      --bg: #050510;
+      --card: #121223;
+      --accent: #ff2e97;
+      --accent-soft: rgba(255,46,151,0.25);
+      --accent2: #22d3ee;
+      --text: #f5f5f5;
+      --muted: #9ca3af;
+      --danger: #f97373;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #1f2933 0, #020617 45%, #000 100%);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      padding: 16px;
+    }
+    .container {
+      width: 100%;
+      max-width: 520px;
+      background: linear-gradient(145deg, rgba(255,255,255,0.02), rgba(15,23,42,0.9));
+      border-radius: 18px;
+      padding: 18px 16px 20px;
+      box-shadow: 0 18px 45px rgba(0,0,0,0.65);
+      border: 1px solid rgba(148,163,184,0.35);
+      backdrop-filter: blur(18px);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .title {
+      font-size: 1.15rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .chip {
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border: 1px solid rgba(248,113,181,0.45);
+    }
+    .current-mode {
+      margin-bottom: 14px;
+      font-size: 0.95rem;
+      color: var(--muted);
+    }
+    .current-mode span {
+      color: var(--accent2);
+      font-weight: 600;
+    }
+    .card {
+      background: rgba(15,23,42,0.88);
+      border-radius: 14px;
+      padding: 12px 12px 10px;
+      margin-bottom: 12px;
+      border: 1px solid rgba(51,65,85,0.85);
+    }
+    .card-title {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .card-title span.label {
+      opacity: 0.85;
+    }
+    .grid-modes {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .btn {
+      border-radius: 999px;
+      padding: 8px 6px;
+      border: none;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      width: 100%;
+      background: radial-gradient(circle at top left, rgba(148,163,255,0.35), rgba(15,23,42,1));
+      color: var(--text);
+      border: 1px solid rgba(148,163,255,0.45);
+      box-shadow: 0 10px 25px rgba(15,23,42,0.85);
+      transition: transform 0.08s ease, box-shadow 0.08s ease, border-color 0.1s ease;
+    }
+    .btn.small {
+      font-size: 0.75rem;
+      padding: 7px 4px;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 16px 30px rgba(15,23,42,0.9);
+      border-color: var(--accent2);
+    }
+    .btn:active {
+      transform: translateY(0);
+      box-shadow: 0 8px 16px rgba(15,23,42,0.95);
+    }
+    .btn.secondary {
+      background: radial-gradient(circle at top right, rgba(45,212,191,0.35), rgba(15,23,42,1));
+      border-color: rgba(45,212,191,0.6);
+    }
+    .btn.danger {
+      background: radial-gradient(circle at top, rgba(248,113,113,0.45), rgba(15,23,42,1));
+      border-color: rgba(248,113,113,0.75);
+      color: var(--danger);
+    }
+    .controls-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .color-preview {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      border: 2px solid rgba(15,23,42,0.9);
+      box-shadow: 0 0 16px rgba(255,255,255,0.25);
+    }
+    input[type="color"] {
+      -webkit-appearance: none;
+      border: none;
+      padding: 0;
+      width: 46px;
+      height: 30px;
+      border-radius: 999px;
+      background: transparent;
+      overflow: hidden;
+    }
+    input[type="color"]::-webkit-color-swatch-wrapper {
+      padding: 0;
+    }
+    input[type="color"]::-webkit-color-swatch {
+      border: none;
+      border-radius: 999px;
+    }
+    .slider-row {
+      margin-top: 6px;
+    }
+    .slider-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 2px;
+    }
+    input[type="range"] {
+      width: 100%;
+    }
+    .footer {
+      margin-top: 8px;
+      font-size: 0.7rem;
+      text-align: center;
+      color: var(--muted);
+      opacity: 0.75;
+    }
+  </style>
+  <script>
+    function refreshStatus() {
+      fetch("/status").then(function(r) {
+        return r.json();
+      }).then(function(data) {
+        var labelEl = document.getElementById("modeLabel");
+        if (labelEl) labelEl.innerText = data.label;
+        var c = data.color;
+        var p = document.getElementById("preview");
+        if (p) p.style.background = c;
+        var picker = document.getElementById("colorPicker");
+        if (picker) picker.value = c;
+        var b = data.brightness;
+        var bright = document.getElementById("brightness");
+        if (bright) {
+          bright.value = b;
+        }
+        var bLabel = document.getElementById("bLabel");
+        if (bLabel) bLabel.innerText = b;
+      }).catch(function(e) {});
+    }
+    function setMode(m) {
+      window.location = "/?mode=" + m;
+      setTimeout(refreshStatus, 400);
+    }
+    function applyCustom() {
+      var color = document.getElementById("colorPicker").value.substring(1);
+      var b = document.getElementById("brightness").value;
+      window.location = "/?mode=1&color=" + color + "&b=" + b;
+      setTimeout(refreshStatus, 500);
+    }
+    function quickPalette(hex, b) {
+      window.location = "/?mode=1&color=" + hex + "&b=" + b;
+      setTimeout(refreshStatus, 500);
+    }
+    function updateBrightnessLabel() {
+      var val = document.getElementById("brightness").value;
+      document.getElementById("bLabel").innerText = val;
+    }
+    function syncPreview() {
+      var c = document.getElementById("colorPicker").value;
+      document.getElementById("preview").style.background = c;
+    }
+    function initPage() {
+      updateBrightnessLabel();
+      syncPreview();
+      refreshStatus();
+      setInterval(refreshStatus, 1500);
+    }
+  </script>
+</head>
+<body onload="initPage();">
+  <div class="container">
+    <div class="header">
+      <div class="title">XIAO ESP32-C6</div>
+      <div class="chip">LED Controller</div>
+    </div>
+    <div class="current-mode">
+      Active mode: <span id="modeLabel">__MODE__</span>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span class="label">Core Animations</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Main effects</span>
+      </div>
+      <div class="grid-modes">
+        <button class="btn" onclick="setMode(0)">🌈 Rainbow</button>
+        <button class="btn secondary" onclick="setMode(7)">✨ Sparkle</button>
+        <button class="btn" onclick="setMode(8)">🌬 Breathing</button>
+        <button class="btn" onclick="setMode(9)">🚨 Larson</button>
+        <button class="btn" onclick="setMode(10)">🎭 Theater</button>
+        <button class="btn" onclick="setMode(11)">🌈 Chase</button>
+        <button class="btn" onclick="setMode(12)">☄️ Comet</button>
+        <button class="btn" onclick="setMode(13)">🔥 Fire</button>
+        <button class="btn" onclick="setMode(14)">🌊 Ocean</button>
+        <button class="btn small" onclick="setMode(15)">🎇 Color Sparkle</button>
+        <button class="btn small" onclick="setMode(16)">🌟 Rainbow Sparkle</button>
+        <button class="btn small" onclick="setMode(18)">🌈 Wave</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span class="label">Color & Brightness</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Custom solid / base color</span>
+      </div>
+      <div class="controls-row">
+        <div id="preview" class="color-preview" style="background:__COLOR__;"></div>
+        <input id="colorPicker" type="color" value="__COLOR__" onchange="syncPreview()">
+        <button class="btn secondary" onclick="applyCustom()">Apply</button>
+      </div>
+      <div class="slider-row">
+        <div class="slider-label">
+          <span>Brightness</span>
+          <span id="bLabel"></span>
+        </div>
+        <input id="brightness" type="range" min="0" max="255" value="__BRIGHT__" oninput="updateBrightnessLabel()">
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span class="label">More FX</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Extra fun stuff</span>
+      </div>
+      <div class="grid-modes">
+        <button class="btn small" onclick="setMode(5)">⚡ Strobe</button>
+        <button class="btn small" onclick="setMode(6)">📶 Wipe</button>
+        <button class="btn small" onclick="setMode(17)">🌫 Flicker</button>
+        <button class="btn small" onclick="setMode(19)">🎲 Random Solid</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span class="label">Quick Palettes</span>
+        <span style="font-size:0.7rem;color:var(--muted);">Tap & go</span>
+      </div>
+      <div class="grid-modes">
+        <button class="btn small" onclick="quickPalette('00ff78',220)">🌲 Forest</button>
+        <button class="btn small" onclick="quickPalette('ff2800',230)">🔥 Lava</button>
+        <button class="btn small" onclick="quickPalette('b000ff',230)">💜 Royal</button>
+        <button class="btn small" onclick="quickPalette('80dfff',255)">❄️ Ice Blue</button>
+        <button class="btn small" onclick="quickPalette('ff6b3d',240)">🌅 Sunset</button>
+        <button class="btn small" onclick="quickPalette('ff00ff',240)">🎀 Magenta</button>
+        <button class="btn small" onclick="quickPalette('ffb000',240)">🧡 Amber</button>
+        <button class="btn small" onclick="quickPalette('00ffc8',240)">🟦 Cyberpunk</button>
+        <button class="btn small" onclick="quickPalette('ffe6cc',220)">🌕 Warm White</button>
+        <button class="btn small" onclick="quickPalette('f4f7ff',255)">💡 Cool White</button>
+        <button class="btn danger small" onclick="quickPalette('000000',0)">⏻ Off</button>
+      </div>
+    </div>
+
+    <div class="footer">
+      Button on D7 still cycles modes • All devices stay in sync via live /status polling
+    </div>
+  </div>
+</body>
+</html>
+"""
+    html = (
+        template
+        .replace("__MODE__", label)
+        .replace("__COLOR__", hex_color)
+        .replace("__BRIGHT__", str(b_val))
+    )
+    return html
+
+def handle_web_request(sock):
+    global mode, current_color, brightness
+
+    try:
+        conn, addr = sock.accept()
+    except OSError:
+        return
+
+    conn.settimeout(1.0)
+    try:
+        request = conn.recv(1024)
+    except OSError:
+        conn.close()
+        return
+
+    if not request:
+        conn.close()
+        return
+
+    try:
+        req = request.decode()
+    except:
+        req = ""
+
+    first_line = req.split("\r\n", 1)[0]
+    parts = first_line.split(" ")
+    path = "/"
+    if len(parts) >= 2:
+        path = parts[1]
+
+    if "?" in path:
+        path_only, qs = path.split("?", 1)
+    else:
+        path_only, qs = path, ""
+
+    # /status -> JSON (for live sync)
+    if path_only == "/status":
+        label = MODE_NAMES[mode]
+        hex_color = color_to_hex(current_color)
+        b_val = brightness
+        json = (
+            '{"mode":' + str(mode) +
+            ',"label":"' + label +
+            '","color":"' + hex_color +
+            '","brightness":' + str(b_val) +
+            '}'
+        )
+        response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + json
+        try:
+            conn.send(response)
+        except OSError:
+            pass
+        conn.close()
+        return
+
+    # Normal page / control
+    params = {}
+    if qs:
+        for pair in qs.split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                params[k] = v
+
+    if "mode" in params:
+        try:
+            m = int(params["mode"])
+            if 0 <= m < NUM_MODES:
+                mode = m
+                print("Mode set:", mode)
+        except:
+            pass
+
+    if "color" in params:
+        c_str = params["color"]
+        if len(c_str) >= 6:
+            try:
+                r = int(c_str[0:2], 16)
+                g = int(c_str[2:4], 16)
+                b = int(c_str[4:6], 16)
+                current_color = (r, g, b)
+                print("Color set:", current_color)
+            except:
+                pass
+
+    if "b" in params:
+        try:
+            b_val = int(params["b"])
+            if b_val < 0:
+                b_val = 0
+            if b_val > 255:
+                b_val = 255
+            brightness = b_val
+            print("Brightness set:", brightness)
+        except:
+            pass
+
+    response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + web_page()
+    try:
+        conn.send(response)
+    except OSError:
+        pass
+    conn.close()
+
+
+# ========= LED HELPERS =========
+
+def scale_color(color, level):
+    r, g, b = color
+    return (r * level // 255, g * level // 255, b * level // 255)
+
+def apply_brightness(color):
+    return scale_color(color, brightness)
+
+def wheel(pos):
+    if pos < 0 or pos > 255:
+        return (0, 0, 0)
+    if pos < 85:
+        return (255 - pos * 3, pos * 3, 0)
+    if pos < 170:
+        pos -= 85
+        return (0, 255 - pos * 3, pos * 3)
+    pos -= 170
+    return (pos * 3, 0, 255 - pos * 3)
+
+def set_solid(color):
+    c = apply_brightness(color)
+    for i in range(NUM_LEDS):
+        np[i] = c
+    np.write()
+
+def clear():
+    for i in range(NUM_LEDS):
+        np[i] = (0, 0, 0)
+    np.write()
+
+
+# ========= BUTTON & MODE HANDLING =========
+
+def update_button(now):
+    global last_button_state, button_stable_state, last_debounce_time, mode
+
+    reading = button.value()
+
+    if reading != last_button_state:
+        last_debounce_time = now
+        last_button_state = reading
+
+    if time.ticks_diff(now, last_debounce_time) > DEBOUNCE_MS:
+        if reading != button_stable_state:
+            button_stable_state = reading
+            if button_stable_state == 0:
+                mode = (mode + 1) % NUM_MODES
+                print("Mode via button:", mode)
+
+def handle_mode_change():
+    global rainbow_offset, last_rainbow_time
+    global last_custom_update
+    global blink_on, last_blink_time
+    global wipe_index, last_wipe_time
+    global last_sparkle_time
+    global breathe_level, breathe_dir, last_breathe_time
+    global larson_pos, larson_dir, last_larson_time
+    global theater_index, last_theater_time
+    global theater2_index, theater2_offset, last_theater2_time
+    global comet_pos, last_comet_time
+    global last_fire_time
+    global wave_offset, last_wave_time
+    global last_color_sparkle_time
+    global last_rainbow_sparkle_time
+    global last_flicker_time
+    global rainbow_wave_offset, last_rainbow_wave_time
+    global last_random_solid_time
+
+    now = time.ticks_ms()
+
+    if mode == 0:
+        rainbow_offset = 0
+        last_rainbow_time = now
+
+    elif mode == 1:
+        last_custom_update = 0
+        set_solid(current_color)
+
+    elif mode == 2:
+        set_solid((0, 255, 120))
+
+    elif mode == 3:
+        set_solid((255, 40, 0))
+
+    elif mode == 4:
+        set_solid((180, 0, 255))
+
+    elif mode == 5:
+        blink_on = False
+        last_blink_time = now
+        clear()
+
+    elif mode == 6:
+        wipe_index = 0
+        last_wipe_time = now
+        clear()
+
+    elif mode == 7:
+        last_sparkle_time = now
+        clear()
+
+    elif mode == 8:
+        breathe_level = 0
+        breathe_dir = 1
+        last_breathe_time = now
+
+    elif mode == 9:
+        larson_pos = 0
+        larson_dir = 1
+        last_larson_time = now
+        clear()
+
+    elif mode == 10:
+        theater_index = 0
+        last_theater_time = now
+        clear()
+
+    elif mode == 11:
+        theater2_index = 0
+        theater2_offset = 0
+        last_theater2_time = now
+        clear()
+
+    elif mode == 12:
+        comet_pos = 0
+        last_comet_time = now
+        clear()
+
+    elif mode == 13:
+        last_fire_time = now
+        clear()
+
+    elif mode == 14:
+        wave_offset = 0
+        last_wave_time = now
+        clear()
+
+    elif mode == 15:
+        last_color_sparkle_time = now
+        clear()
+
+    elif mode == 16:
+        last_rainbow_sparkle_time = now
+        clear()
+
+    elif mode == 17:
+        last_flicker_time = now
+        clear()
+
+    elif mode == 18:
+        rainbow_wave_offset = 0
+        last_rainbow_wave_time = now
+
+    elif mode == 19:
+        last_random_solid_time = now
+        clear()
+
+def run_mode_step(now):
+    global rainbow_offset, last_rainbow_time
+    global last_custom_update
+    global blink_on, last_blink_time
+    global wipe_index, last_wipe_time
+    global last_sparkle_time
+    global breathe_level, breathe_dir, last_breathe_time
+    global larson_pos, larson_dir, last_larson_time
+    global theater_index, last_theater_time
+    global theater2_index, theater2_offset, last_theater2_time
+    global comet_pos, last_comet_time
+    global last_fire_time
+    global wave_offset, last_wave_time
+    global last_color_sparkle_time
+    global last_rainbow_sparkle_time
+    global last_flicker_time
+    global rainbow_wave_offset, last_rainbow_wave_time
+    global last_random_solid_time
+
+    # 0: Rainbow Flow
+    if mode == 0:
+        if time.ticks_diff(now, last_rainbow_time) > 50:
+            for i in range(NUM_LEDS):
+                pos = (i * 256 // NUM_LEDS + rainbow_offset) & 255
+                col = wheel(pos)
+                np[i] = apply_brightness(col)
+            np.write()
+            rainbow_offset = (rainbow_offset + 5) & 255
+            last_rainbow_time = now
+
+    # 1: Custom Solid
+    elif mode == 1:
+        if time.ticks_diff(now, last_custom_update) > 150:
+            set_solid(current_color)
+            last_custom_update = now
+
+    # 2,3,4: static presets
+
+    # 5: Strobe
+    elif mode == 5:
+        if time.ticks_diff(now, last_blink_time) > 220:
+            blink_on = not blink_on
+            if blink_on:
+                set_solid(current_color)
+            else:
+                clear()
+            last_blink_time = now
+
+    # 6: Color Wipe
+    elif mode == 6:
+        if time.ticks_diff(now, last_wipe_time) > 90:
+            for i in range(NUM_LEDS):
+                np[i] = (0, 0, 0)
+            np[wipe_index] = apply_brightness(current_color)
+            np.write()
+            wipe_index = (wipe_index + 1) % NUM_LEDS
+            last_wipe_time = now
+
+    # 7: Sparkle (white)
+    elif mode == 7:
+        if time.ticks_diff(now, last_sparkle_time) > 70:
+            for i in range(NUM_LEDS):
+                r, g, b = np[i]
+                np[i] = (r // 2, g // 2, b // 2)
+            idx = urandom.getrandbits(8) % NUM_LEDS
+            np[idx] = apply_brightness((255, 255, 255))
+            np.write()
+            last_sparkle_time = now
+
+    # 8: Breathing (custom color)
+    elif mode == 8:
+        if time.ticks_diff(now, last_breathe_time) > 40:
+            breathe_level += 6 * breathe_dir
+            if breathe_level >= 255:
+                breathe_level = 255
+                breathe_dir = -1
+            if breathe_level <= 40:
+                breathe_level = 40
+                breathe_dir = 1
+            eff = brightness * breathe_level // 255
+            col = scale_color(current_color, eff)
+            for i in range(NUM_LEDS):
+                np[i] = col
+            np.write()
+            last_breathe_time = now
+
+    # 9: Larson Scanner
+    elif mode == 9:
+        if time.ticks_diff(now, last_larson_time) > 80:
+            for i in range(NUM_LEDS):
+                np[i] = (0, 0, 0)
+
+            main_col = apply_brightness(current_color)
+            dim_col = scale_color(current_color, max(brightness // 4, 10))
+
+            np[larson_pos] = main_col
+            if larson_pos - 1 >= 0:
+                np[larson_pos - 1] = dim_col
+            if larson_pos + 1 < NUM_LEDS:
+                np[larson_pos + 1] = dim_col
+
+            np.write()
+
+            larson_pos += larson_dir
+            if larson_pos <= 0:
+                larson_pos = 0
+                larson_dir = 1
+            elif larson_pos >= NUM_LEDS - 1:
+                larson_pos = NUM_LEDS - 1
+                larson_dir = -1
+
+            last_larson_time = now
+
+    # 10: Theater Chase
+    elif mode == 10:
+        if time.ticks_diff(now, last_theater_time) > 90:
+            for i in range(NUM_LEDS):
+                np[i] = (0, 0, 0)
+            c = apply_brightness(current_color)
+            for j in range(theater_index, NUM_LEDS, 3):
+                np[j] = c
+            np.write()
+            theater_index = (theater_index + 1) % 3
+            last_theater_time = now
+
+    # 11: Rainbow Chase
+    elif mode == 11:
+        if time.ticks_diff(now, last_theater2_time) > 90:
+            for i in range(NUM_LEDS):
+                np[i] = (0, 0, 0)
+            for j in range(theater2_index, NUM_LEDS, 3):
+                pos = (j * 256 // NUM_LEDS + theater2_offset) & 255
+                col = wheel(pos)
+                np[j] = apply_brightness(col)
+            np.write()
+            theater2_index = (theater2_index + 1) % 3
+            theater2_offset = (theater2_offset + 8) & 255
+            last_theater2_time = now
+
+    # 12: Comet
+    elif mode == 12:
+        if time.ticks_diff(now, last_comet_time) > 70:
+            for i in range(NUM_LEDS):
+                r, g, b = np[i]
+                np[i] = (r * 2 // 3, g * 2 // 3, b * 2 // 3)
+            np[comet_pos] = apply_brightness(current_color)
+            np.write()
+            comet_pos = (comet_pos + 1) % NUM_LEDS
+            last_comet_time = now
+
+    # 13: Fire Flicker
+    elif mode == 13:
+        if time.ticks_diff(now, last_fire_time) > 80:
+            base = (255, 80, 0)
+            for i in range(NUM_LEDS):
+                s = 100 + (urandom.getrandbits(8) % 156)
+                col = scale_color(base, s)
+                np[i] = apply_brightness(col)
+            np.write()
+            last_fire_time = now
+
+    # 14: Ocean Wave
+    elif mode == 14:
+        if time.ticks_diff(now, last_wave_time) > 80:
+            intensities = [20, 60, 120, 200, 255, 200, 120, 60]
+            L = len(intensities)
+            for i in range(NUM_LEDS):
+                idx = (i + wave_offset) % L
+                h = intensities[idx]
+                col = (0, h // 2, h)
+                np[i] = apply_brightness(col)
+            np.write()
+            wave_offset = (wave_offset + 1) % L
+            last_wave_time = now
+
+    # 15: Color Sparkle (custom color)
+    elif mode == 15:
+        if time.ticks_diff(now, last_color_sparkle_time) > 70:
+            for i in range(NUM_LEDS):
+                r, g, b = np[i]
+                np[i] = (r // 2, g // 2, b // 2)
+            idx = urandom.getrandbits(8) % NUM_LEDS
+            np[idx] = apply_brightness(current_color)
+            np.write()
+            last_color_sparkle_time = now
+
+    # 16: Rainbow Sparkle
+    elif mode == 16:
+        if time.ticks_diff(now, last_rainbow_sparkle_time) > 80:
+            for i in range(NUM_LEDS):
+                r, g, b = np[i]
+                np[i] = (r // 2, g // 2, b // 2)
+            idx = urandom.getrandbits(8) % NUM_LEDS
+            pos = urandom.getrandbits(8)
+            col = wheel(pos)
+            np[idx] = apply_brightness(col)
+            np.write()
+            last_rainbow_sparkle_time = now
+
+    # 17: Soft Flicker (custom color)
+    elif mode == 17:
+        if time.ticks_diff(now, last_flicker_time) > 70:
+            for i in range(NUM_LEDS):
+                s = 120 + (urandom.getrandbits(8) % 120)
+                col = scale_color(current_color, s)
+                np[i] = apply_brightness(col)
+            np.write()
+            last_flicker_time = now
+
+    # 18: Rainbow Wave
+    elif mode == 18:
+        if time.ticks_diff(now, last_rainbow_wave_time) > 60:
+            for i in range(NUM_LEDS):
+                pos = (i * 256 // NUM_LEDS + rainbow_wave_offset) & 255
+                col = wheel(pos)
+                np[i] = apply_brightness(col)
+            np.write()
+            rainbow_wave_offset = (rainbow_wave_offset + 4) & 255
+            last_rainbow_wave_time = now
+
+    # 19: Random Solid Colors
+    elif mode == 19:
+        if time.ticks_diff(now, last_random_solid_time) > 800:
+            pos = urandom.getrandbits(8)
+            col = wheel(pos)
+            set_solid(col)
+            last_random_solid_time = now
+
+
+# ========= MAIN =========
+
+wlan = connect_wifi()
+sock = start_web_server(wlan)
+
+handle_mode_change()
+last_mode = mode
+
+while True:
+    now = time.ticks_ms()
+
+    update_button(now)
+
+    if mode != last_mode:
+        handle_mode_change()
+        last_mode = mode
+
+    run_mode_step(now)
+
+    handle_web_request(sock)
+
+    time.sleep_ms(10)
+

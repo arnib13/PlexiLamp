@@ -1,0 +1,311 @@
+from machine import Pin
+import time
+import neopixel
+import urandom
+import network
+import socket
+
+# ========= WIFI CONFIG =========
+WIFI_SSID = "YOUR_WIFI_SSID"
+WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
+
+# ========= LED / BUTTON CONFIG =========
+NUM_LEDS = 12
+LED_PIN = 16       # D6 (works for your setup)
+BUTTON_PIN = 17    # D7 -> adjust GPIO if needed
+DEBOUNCE_MS = 200
+
+# ========= GLOBAL STATE =========
+mode = 0               # 0..6
+last_mode = -1
+
+last_button_state = 1
+button_stable_state = 1
+last_debounce_time = 0
+
+rainbow_offset = 0
+last_rainbow_time = 0
+
+blink_on = False
+last_blink_time = 0
+
+wipe_index = 0
+last_wipe_time = 0
+
+last_sparkle_time = 0
+
+# ========= HARDWARE SETUP =========
+np = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), NUM_LEDS)
+button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)  # button to GND
+
+# ========= WIFI + WEB SERVER SETUP =========
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if not wlan.isconnected():
+        print("Connecting to WiFi...")
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+        while not wlan.isconnected():
+            time.sleep(0.5)
+            print(".", end="")
+        print()
+    print("Connected, IP:", wlan.ifconfig()[0])
+    return wlan
+
+def start_web_server():
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(addr)
+    s.listen(1)
+    s.settimeout(0.1)  # non-blocking-ish
+    print("Web server listening on http://%s/" % wlan.ifconfig()[0])
+    return s
+
+def web_page():
+    mode_names = [
+        "0: Rainbow",
+        "1: Green",
+        "2: Red",
+        "3: Purple",
+        "4: Blinking White",
+        "5: Color Wipe",
+        "6: Sparkle",
+    ]
+    current = mode_names[mode]
+    # Very simple HTML with links for each mode
+    html = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>XIAO ESP32-C6 LED Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: sans-serif; background:#111; color:#eee; text-align:center; }
+    h1 { margin-top:20px; }
+    .btn {
+      display:inline-block; margin:6px; padding:10px 16px;
+      border-radius:8px; text-decoration:none; color:#fff;
+      background:#444;
+    }
+    .btn:hover { background:#666; }
+    .current { margin: 16px 0; font-size: 1.2em; }
+  </style>
+</head>
+<body>
+  <h1>XIAO ESP32-C6 LEDs</h1>
+  <div class="current">Current mode: <strong>%s</strong></div>
+  <div>
+    <a class="btn" href="/?mode=0">Rainbow</a>
+    <a class="btn" href="/?mode=1">Green</a>
+    <a class="btn" href="/?mode=2">Red</a><br>
+    <a class="btn" href="/?mode=3">Purple</a>
+    <a class="btn" href="/?mode=4">Blink</a><br>
+    <a class="btn" href="/?mode=5">Color Wipe</a>
+    <a class="btn" href="/?mode=6">Sparkle</a>
+  </div>
+</body>
+</html>
+""" % current
+    return html
+
+def handle_web_request(sock):
+    """Non-blocking-ish: handle a single pending HTTP client if any."""
+    global mode
+    try:
+        conn, addr = sock.accept()
+    except OSError:
+        # No incoming connection
+        return
+
+    # Got a connection
+    # print("Client:", addr)
+    conn.settimeout(1.0)
+    try:
+        request = conn.recv(1024)
+    except OSError:
+        conn.close()
+        return
+
+    if not request:
+        conn.close()
+        return
+
+    try:
+        req = request.decode()
+    except:
+        req = ""
+
+    # Very basic parsing: look for /?mode=X
+    idx = req.find("/?mode=")
+    if idx != -1:
+        idx += len("/?mode=")
+        m_str = ""
+        while idx < len(req) and req[idx].isdigit():
+            m_str += req[idx]
+            idx += 1
+        if m_str:
+            m = int(m_str)
+            if 0 <= m <= 6:
+                mode = m
+                print("Mode set via web:", mode)
+
+    response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n" + web_page()
+    try:
+        conn.send(response)
+    except OSError:
+        pass
+    conn.close()
+
+# ========= LED HELPER FUNCTIONS =========
+
+def wheel(pos):
+    """Color wheel helper: 0-255 -> (r,g,b)."""
+    if pos < 0 or pos > 255:
+        return (0, 0, 0)
+    if pos < 85:
+        return (255 - pos * 3, pos * 3, 0)
+    if pos < 170:
+        pos -= 85
+        return (0, 255 - pos * 3, pos * 3)
+    pos -= 170
+    return (pos * 3, 0, 255 - pos * 3)
+
+def set_solid(color):
+    for i in range(NUM_LEDS):
+        np[i] = color
+    np.write()
+
+def clear():
+    set_solid((0, 0, 0))
+
+# ========= BUTTON + MODE HANDLING =========
+
+def update_button(now):
+    """Debounced button read. On press: cycle mode."""
+    global last_button_state, button_stable_state, last_debounce_time, mode
+
+    reading = button.value()
+
+    if reading != last_button_state:
+        last_debounce_time = now
+        last_button_state = reading
+
+    if time.ticks_diff(now, last_debounce_time) > DEBOUNCE_MS:
+        if reading != button_stable_state:
+            button_stable_state = reading
+            if button_stable_state == 0:  # pressed (active low)
+                mode = (mode + 1) % 7
+                print("Mode via button:", mode)
+
+def handle_mode_change():
+    """Reset per-mode state / set static colors on mode change."""
+    global rainbow_offset, blink_on, wipe_index
+    global last_rainbow_time, last_blink_time, last_wipe_time, last_sparkle_time
+
+    now = time.ticks_ms()
+
+    if mode == 0:        # Rainbow
+        rainbow_offset = 0
+        last_rainbow_time = now
+
+    elif mode == 1:      # Solid Green
+        set_solid((0, 255, 0))
+
+    elif mode == 2:      # Solid Red
+        set_solid((255, 0, 0))
+
+    elif mode == 3:      # Solid Purple
+        set_solid((128, 0, 128))
+
+    elif mode == 4:      # Blinking White
+        blink_on = False
+        last_blink_time = now
+        clear()
+
+    elif mode == 5:      # Color Wipe (red)
+        wipe_index = 0
+        last_wipe_time = now
+        clear()
+
+    elif mode == 6:      # Sparkle
+        last_sparkle_time = now
+        clear()
+
+def run_mode_step(now):
+    """One non-blocking step of the current mode."""
+    global rainbow_offset, last_rainbow_time
+    global blink_on, last_blink_time
+    global wipe_index, last_wipe_time
+    global last_sparkle_time
+
+    # Mode 0: Rainbow
+    if mode == 0:
+        if time.ticks_diff(now, last_rainbow_time) > 50:
+            for i in range(NUM_LEDS):
+                pos = (i * 256 // NUM_LEDS + rainbow_offset) & 255
+                np[i] = wheel(pos)
+            np.write()
+            rainbow_offset = (rainbow_offset + 5) & 255
+            last_rainbow_time = now
+
+    # Modes 1,2,3: solid colors (no per-frame updates)
+
+    # Mode 4: Blinking white
+    elif mode == 4:
+        if time.ticks_diff(now, last_blink_time) > 500:
+            blink_on = not blink_on
+            set_solid((255, 255, 255) if blink_on else (0, 0, 0))
+            last_blink_time = now
+
+    # Mode 5: Color wipe (red)
+    elif mode == 5:
+        if time.ticks_diff(now, last_wipe_time) > 100:
+            for i in range(NUM_LEDS):
+                np[i] = (0, 0, 0)
+            np[wipe_index] = (255, 0, 0)
+            np.write()
+            wipe_index = (wipe_index + 1) % NUM_LEDS
+            last_wipe_time = now
+
+    # Mode 6: Sparkle
+    elif mode == 6:
+        if time.ticks_diff(now, last_sparkle_time) > 80:
+            # Fade existing LEDs
+            for i in range(NUM_LEDS):
+                r, g, b = np[i]
+                np[i] = (r // 2, g // 2, b // 2)
+            # Random LED to bright white
+            idx = urandom.getrandbits(8) % NUM_LEDS
+            np[idx] = (255, 255, 255)
+            np.write()
+            last_sparkle_time = now
+
+# ========= MAIN =========
+
+wlan = connect_wifi()
+sock = start_web_server()
+
+handle_mode_change()
+last_mode = mode
+
+while True:
+    now = time.ticks_ms()
+
+    # Handle button
+    update_button(now)
+
+    # Handle mode changes
+    if mode != last_mode:
+        handle_mode_change()
+        last_mode = mode
+
+    # Step the current LED effect
+    run_mode_step(now)
+
+    # Handle one web request if pending
+    handle_web_request(sock)
+
+    time.sleep_ms(10)
+
